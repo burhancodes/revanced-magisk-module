@@ -7,4 +7,4 @@ parallel-jobs = 1
 # you can use rvmm-config-gen to generate a config
 
 [Spotify]
-uptodown-dlurl = "https://spotify.en.uptodown.com/android"
+apkpure-dlurl = "https://apkpure.net/spotify-music-and-podcasts-for-android/com.spotify.music/download"
