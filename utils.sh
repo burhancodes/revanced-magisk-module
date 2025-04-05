@@ -167,8 +167,19 @@ config_update() {
 _req() {
 	local ip="$1" op="$2"
 	shift 2
+	# Array of User-Agents to rotate through
+	local user_agents=(
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+		"Mozilla/5.0 (X11; Linux x86_64; rv:108.0) Gecko/20100101 Firefox/108.0"
+		"Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.1 Mobile/15E148 Safari/604.1"
+	)
+	# Pick a random User-Agent
+	local ua_index=$((RANDOM % ${#user_agents[@]}))
+	local user_agent="${user_agents[$ua_index]}"
+
 	if [ "$op" = - ]; then
-		if ! curl -L -c "$TEMP_DIR/cookie.txt" -b "$TEMP_DIR/cookie.txt" --connect-timeout 5 --retry 0 --fail -s -S "$@" "$ip"; then
+		if ! curl -L -c "$TEMP_DIR/cookie.txt" -b "$TEMP_DIR/cookie.txt" --connect-timeout 5 --retry 2 --retry-delay 2 --fail -s -S -H "User-Agent: $user_agent" "$@" "$ip"; then
 			epr "Request failed: $ip"
 			return 1
 		fi
@@ -180,14 +191,14 @@ _req() {
 			while [ -f "$dlp" ]; do sleep 1; done
 			return
 		fi
-		if ! curl -L -c "$TEMP_DIR/cookie.txt" -b "$TEMP_DIR/cookie.txt" --connect-timeout 5 --retry 0 --fail -s -S "$@" "$ip" -o "$dlp"; then
+		if ! curl -L -c "$TEMP_DIR/cookie.txt" -b "$TEMP_DIR/cookie.txt" --connect-timeout 5 --retry 2 --retry-delay 2 --fail -s -S -H "User-Agent: $user_agent" "$@" "$ip" -o "$dlp"; then
 			epr "Request failed: $ip"
 			return 1
 		fi
 		mv -f "$dlp" "$op"
 	fi
 }
-req() { _req "$1" "$2" -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:108.0) Gecko/20100101 Firefox/108.0"; }
+req() { _req "$1" "$2"; }
 gh_req() { _req "$1" "$2" -H "$GH_HEADER"; }
 gh_dl() {
 	if [ ! -f "$1" ]; then
@@ -196,82 +207,27 @@ gh_dl() {
 	fi
 }
 
-log() { echo -e "$1  " >>"build.md"; }
-get_highest_ver() {
-	local vers m
-	vers=$(tee)
-	m=$(head -1 <<<"$vers")
-	if ! semver_validate "$m"; then echo "$m"; else sort -rV <<<"$vers" | head -1; fi
-}
-semver_validate() {
-	local a="${1%-*}"
-	local ac="${a//[.0-9]/}"
-	[ ${#ac} = 0 ]
-}
-get_patch_last_supported_ver() {
-	local list_patches=$1 pkg_name=$2 inc_sel=$3 _exc_sel=$4 _exclusive=$5
-	local op
-	if [ "$inc_sel" ]; then
-		if ! op=$(awk '{$1=$1}1' <<<"$list_patches"); then
-			epr "list-patches: '$op'"
-			return 1
-		fi
-		local ver vers="" NL=$'\n'
-		while IFS= read -r line; do
-			line="${line:1:${#line}-2}"
-			ver=$(sed -n "/^Name: $line\$/,/^\$/p" <<<"$op" | sed -n "/^Compatible versions:\$/,/^\$/p" | tail -n +2)
-			vers=${ver}${NL}
-		done <<<"$(list_args "$inc_sel")"
-		vers=$(awk '{$1=$1}1' <<<"$vers")
-		if [ "$vers" ]; then
-			get_highest_ver <<<"$vers"
-			return
-		fi
-	fi
-	if ! op=$(java -jar "$rv_cli_jar" list-versions "$rv_patches_jar" -f "$pkg_name" 2>&1 | tail -n +3 | awk '{$1=$1}1'); then
-		epr "list-versions: '$op'"
-		return 1
-	fi
-	if [ "$op" = "Any" ]; then return; fi
-	pcount=$(head -1 <<<"$op") pcount=${pcount#*(} pcount=${pcount% *}
-	if [ -z "$pcount" ]; then abort "unreachable: '$pcount'"; fi
-	grep -F "($pcount patch" <<<"$op" | sed 's/ (.* patch.*//' | get_highest_ver || return 1
-}
-
-isoneof() {
-	local i=$1 v
-	shift
-	for v; do [ "$v" = "$i" ] && return 0; done
-	return 1
-}
-
-merge_splits() {
-	local bundle=$1 output=$2
-	pr "Merging splits"
-	gh_dl "$TEMP_DIR/apkeditor.jar" "https://github.com/REAndroid/APKEditor/releases/download/V1.4.2/APKEditor-1.4.2.jar" >/dev/null || return 1
-	if ! OP=$(java -jar "$TEMP_DIR/apkeditor.jar" merge -i "${bundle}" -o "${bundle}.mzip" -clean-meta -f 2>&1); then
-		epr "Apkeditor ERROR: $OP"
-		return 1
-	fi
-	mkdir "${bundle}-zip"
-	unzip -qo "${bundle}.mzip" -d "${bundle}-zip"
-	(
-		cd "${bundle}-zip" || abort
-		zip -0rq "${CWD}/${bundle}.zip" .
-	)
-	cp "${bundle}.zip" "${output}"
-	rm -r "${bundle}-zip" "${bundle}.zip" "${bundle}.mzip" || :
-	return $?
-}
-
 # -------------------- apkpure --------------------
 get_apkpure_resp() {
-	__APKPURE_RESP__=$(req "${1}" -)
-	__APKPURE_DL_RESP__=$(req "${1}/download?from=details" -)
+	# Try the base URL first
+	__APKPURE_RESP__=$(req "${1}" -) || return 1
+	# Try the download URL with a fallback if 403 occurs
+	__APKPURE_DL_RESP__=$(req "${1}/download?from=details" -) || {
+		epr "Failed to access download page, trying alternative..."
+		__APKPURE_DL_RESP__=$(req "${1}/download" -) || return 1
+	}
 }
 get_apkpure_vers() {
 	local versions
-	versions=$($HTMLQ ".ver-item-v" --text <<<"$__APKPURE_RESP__" | awk '{$1=$1};1')
+	# Updated selector based on current APKPure structure (as of 2023, may need further adjustment)
+	versions=$($HTMLQ ".version-list .version-item" --text <<<"$__APKPURE_RESP__" | awk '{$1=$1};1') || {
+		epr "Could not parse versions from APKPure, falling back to scraping..."
+		versions=$(grep -oP '(?<=Version: )[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?' <<<"$__APKPURE_RESP__" | awk '{$1=$1};1')
+	}
+	if [ -z "$versions" ]; then
+		epr "No versions found on APKPure page"
+		return 1
+	fi
 	if [ "$__AAV__" = false ]; then
 		grep -iv "\(beta\|alpha\)" <<<"$versions"
 	else
@@ -281,18 +237,37 @@ get_apkpure_vers() {
 dl_apkpure() {
 	local url=$1 version=$2 output=$3 arch=$4 _dpi=$5
 	local dl_url
-	
-	dl_url=$($HTMLQ "#download_link" --attribute href <<<"$__APKPURE_DL_RESP__") || return 1
-	
+
+	# Try to get the download link from the page
+	dl_url=$($HTMLQ "#download_link" --attribute href <<<"$__APKPURE_DL_RESP__") || {
+		epr "Failed to find download link with #download_link, trying alternative..."
+		dl_url=$(grep -oP '(?<=href=")[^"]+\.apk[^"]*' <<<"$__APKPURE_DL_RESP__" | head -1) || {
+			epr "No APK download link found on APKPure page"
+			return 1
+		}
+	}
+
+	# Check if it's a split APK (XAPK/APKM) or regular APK
 	if [[ "$dl_url" =~ \.(xapk|apkm)$ ]]; then
+		pr "Downloading XAPK/APKM from $dl_url"
 		req "$dl_url" "${output}.apkm" || return 1
-		merge_splits "${output}.apkm" "$output"
+		merge_splits "${output}.apkm" "$output" || return 1
 	else
+		pr "Downloading APK from $dl_url"
 		req "$dl_url" "$output" || return 1
 	fi
 }
 get_apkpure_pkg_name() {
-	$HTMLQ "p.file" --text <<<"$__APKPURE_RESP__" | grep -oP '(?<=Package: ).*?(?= Size:)' | head -1
+	# Updated selector based on current APKPure structure
+	local pkg_name
+	pkg_name=$($HTMLQ ".package-name" --text <<<"$__APKPURE_RESP__" | awk '{$1=$1};1') || {
+		epr "Could not find package name with .package-name, falling back to scraping..."
+		pkg_name=$(grep -oP '(?<=Package: )[^<]+' <<<"$__APKPURE_RESP__" | head -1 | awk '{$1=$1};1') || {
+			epr "Failed to extract package name from APKPure page"
+			return 1
+		}
+	}
+	echo "$pkg_name"
 }
 
 # -------------------- archive --------------------
