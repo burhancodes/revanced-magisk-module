@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 
-MODULE_TEMPLATE_DIR="revanced-magisk"
 CWD=$(pwd)
 TEMP_DIR="temp"
 BIN_DIR="bin"
@@ -98,22 +97,8 @@ get_rv_prebuilts() {
 			tag_name=$(cut -d'-' -f3- <<<"$name")
 			tag_name=v${tag_name%.*}
 		fi
-		if [ "$tag" = "Patches" ]; then
-			if [ $grab_cl = true ]; then echo -e "[Changelog](https://github.com/${src}/releases/tag/${tag_name})\n" >>"${cl_dir}/changelog.md"; fi
-			if [ "$REMOVE_RV_INTEGRATIONS_CHECKS" = true ]; then
-				if ! (
-					mkdir -p "${file}-zip" || return 1
-					unzip -qo "${file}" -d "${file}-zip" || return 1
-					java -cp "${BIN_DIR}/paccer.jar:${BIN_DIR}/dexlib2.jar" com.jhc.Main "${file}-zip/extensions/shared.rve" "${file}-zip/extensions/shared-patched.rve" || return 1
-					mv -f "${file}-zip/extensions/shared-patched.rve" "${file}-zip/extensions/shared.rve" || return 1
-					rm "${file}" || return 1
-					cd "${file}-zip" || abort
-					zip -0rq "${CWD}/${file}" . || return 1
-				) >&2; then
-					echo >&2 "Patching revanced-integrations failed"
-				fi
-				rm -r "${file}-zip" || :
-			fi
+		if [ "$tag" = "Patches" ] && [ $grab_cl = true ]; then
+			echo -e "[Changelog](https://github.com/${src}/releases/tag/${tag_name})\n" >>"${cl_dir}/changelog.md"
 		fi
 		echo -n "$file "
 	done
@@ -224,7 +209,7 @@ semver_validate() {
 	[ ${#ac} = 0 ]
 }
 get_patch_last_supported_ver() {
-	local list_patches=$1 pkg_name=$2 inc_sel=$3 _exc_sel=$4 _exclusive=$5 # TODO: resolve using all of these
+	local list_patches=$1 pkg_name=$2 inc_sel=$3 _exc_sel=$4 _exclusive=$5
 	local op
 	if [ "$inc_sel" ]; then
 		if ! op=$(awk '{$1=$1}1' <<<"$list_patches"); then
@@ -268,23 +253,15 @@ merge_splits() {
 		epr "Apkeditor ERROR: $OP"
 		return 1
 	fi
-	# this is required because of apksig
-	mkdir "${bundle}-  zip"
+	mkdir "${bundle}-zip"
 	unzip -qo "${bundle}.mzip" -d "${bundle}-zip"
 	(
 		cd "${bundle}-zip" || abort
 		zip -0rq "${CWD}/${bundle}.zip" .
 	)
-	# if building module, sign the merged apk properly
-	if isoneof "module" "${build_mode_arr[@]}"; then
-		patch_apk "${bundle}.zip" "${output}" "--exclusive" "${args[cli]}" "${args[ptjar]}"
-		local ret=$?
-	else
-		cp "${bundle}.zip" "${output}"
-		local ret=$?
-	fi
+	cp "${bundle}.zip" "${output}"
 	rm -r "${bundle}-zip" "${bundle}.zip" "${bundle}.mzip" || :
-	return $ret
+	return $?
 }
 
 # -------------------- apkpure --------------------
@@ -303,15 +280,13 @@ get_apkpure_vers() {
 }
 dl_apkpure() {
 	local url=$1 version=$2 output=$3 arch=$4 _dpi=$5
-	local dl_url apk_type
+	local dl_url
 	
-	# Get download URL
 	dl_url=$($HTMLQ "#download_link" --attribute href <<<"$__APKPURE_DL_RESP__") || return 1
 	
-	# Check if it's an XAPK/APKM bundle
 	if [[ "$dl_url" =~ \.(xapk|apkm)$ ]]; then
 		req "$dl_url" "${output}.apkm" || return 1
-		merge_splits "${output}.apkm" "${output}"
+		merge_splits "${output}.apkm" "$output"
 	else
 		req "$dl_url" "$output" || return 1
 	fi
@@ -361,7 +336,7 @@ check_sig() {
 build_rv() {
 	eval "declare -A args=${1#*=}"
 	local version="" pkg_name=""
-	local mode_arg=${args[build_mode]} version_mode=${args[version]}
+	local version_mode=${args[version]}
 	local app_name=${args[app_name]}
 	local app_name_l=${app_name,,}
 	app_name_l=${app_name_l// /-}
@@ -417,14 +392,6 @@ build_rv() {
 		return 0
 	fi
 
-	if [ "$mode_arg" = module ]; then
-		build_mode_arr=(module)
-	elif [ "$mode_arg" = apk ]; then
-		build_mode_arr=(apk)
-	elif [ "$mode_arg" = both ]; then
-		build_mode_arr=(apk module)
-	fi
-
 	pr "Choosing version '${version}' for ${table}"
 	local version_f=${version// /}
 	version_f=${version_f#v}
@@ -447,18 +414,12 @@ build_rv() {
 	fi
 	log "${table}: ${version}"
 
-	local microg_patch
-	microg_patch=$(grep "^Name: " <<<"$list_patches" | grep -i "gmscore\|microg" || :) microg_patch=${microg_patch#*: }
-	if [ -n "$microg_patch" ] && [[ ${p_patcher_args[*]} =~ $microg_patch ]]; then
-		epr "You cant include/exclude microg patch as that's done by rvmm builder automatically."
-		p_patcher_args=("${p_patcher_args[@]//-[ei] ${microg_patch}/}")
-	fi
-
-	local patcher_args patched_apk build_mode
+	local patcher_args patched_apk
 	local rv_brand_f=${args[rv_brand],,}
 	rv_brand_f=${rv_brand_f// /-}
 	if [ "${args[patcher_args]}" ]; then p_patcher_args+=("${args[patcher_args]}"); fi
-	for build_mode in "${build_mode_arr[@]}"; do
-		patcher_args=("${p_patcher_args[@]}")
-		pr "Building '${table}' in '$build_mode' mode"
-		if [ -n "$microg_patch" ];
+	patcher_args=("${p_patcher_args[@]}")
+	patched_apk="${BUILD_DIR}/${app_name_l}-${rv_brand_f}-${version_f}-${arch_f}.apk"
+	pr "Building '${table}' as APK"
+	patch_apk "$stock_apk" "$patched_apk" "$patcher_args" "${args[cli]}" "${args[ptjar]}" || abort "Failed to patch ${table}"
+}
